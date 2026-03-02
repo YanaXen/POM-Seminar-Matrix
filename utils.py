@@ -132,3 +132,152 @@ def extract_schedule_cars(S, Y, duration, type_of, CARS, J, R, T, eps=0.5):
             dur = duration[v][j]
             sched.append((mach[(c, j)], start[(c, j)], dur, c, j))
     return sched
+
+
+def active_interval_utilization(schedule, R=None, skip_first_last=True):
+    """
+    Active-window utilization per machine.
+
+    Active window for machine r:
+        [first_start_r, last_end_r] over all jobs with dur > 0 on r
+    Busy time:
+        sum of (dur) of those jobs on r  (assumes no overlap due to capacity constraint)
+
+    Utilization_active = busy_time / (last_end - first_start)
+
+    Skips machines with no positive-duration jobs.
+    Optionally skips the first and last machine index (often source/sink with dur=0).
+    
+    Args:
+        schedule: list of tuples (machine, start, dur, c, j) or (machine, start, dur, ...)
+        R: total number of machines (optional). If None, inferred from schedule.
+        skip_first_last: if True, skips machine 0 and machine R-1 (or min/max inferred).
+
+    Returns:
+        active_usage: list of (r, busy_time, active_window, util_active, first_start, last_end)
+                      sorted by r
+    """
+    machine_stats = defaultdict(lambda: {"busy": 0.0, "first": None, "last": None})
+
+    # collect busy time + first/last times (ignore dur==0)
+    for r, start, dur, *_ in schedule:
+        if dur is None or dur <= 0:
+            continue
+        end = start + dur
+
+        st = machine_stats[r]
+        st["busy"] += float(dur)
+        st["first"] = start if st["first"] is None else min(st["first"], start)
+        st["last"]  = end   if st["last"]  is None else max(st["last"],  end)
+
+    if not machine_stats:
+        return []
+
+    # determine machine universe + which to skip
+    if R is not None:
+        all_machines = list(range(R))
+        first_machine, last_machine = 0, R - 1
+    else:
+        all_machines = sorted(machine_stats.keys())
+        first_machine, last_machine = min(all_machines), max(all_machines)
+
+    skip_set = set()
+    if skip_first_last:
+        skip_set.update([first_machine, last_machine])
+
+    active_usage = []
+    for r in all_machines:
+        if r in skip_set:
+            continue
+        if r not in machine_stats:
+            continue  # no positive-duration jobs -> no active window
+
+        busy = machine_stats[r]["busy"]
+        first = machine_stats[r]["first"]
+        last = machine_stats[r]["last"]
+        active_window = float(last - first) if (first is not None and last is not None) else 0.0
+
+        util_active = (busy / active_window) if active_window > 0 else 0.0
+        active_usage.append((r, busy, active_window, util_active, first, last))
+
+    return sorted(active_usage, key=lambda x: x[0])
+
+
+def build_greedy_warmstart(CARS, J, R, T, duration, type_of, predecessors, allowed_machines):
+    """
+    Returns:
+      start_time[(c,j)] = integer start time
+      machine[(c,j)]    = chosen machine r
+    """
+    # when each machine becomes available again
+    mach_ready = [0] * R
+
+    # when each car becomes available again (since your model forbids overlapping jobs per car)
+    car_ready = [0] * CARS
+
+    # end times for precedence lookup
+    end_time = {}  # (c,j) -> end
+
+    start_time = {}
+    machine = {}
+
+    for c in range(CARS):
+        v = type_of[c]
+        for j in range(J):
+            # precedence finish time for this car/job
+            preds = predecessors[j]
+            pred_ready = 0
+            if preds:
+                pred_ready = max(end_time[(c, h)] for h in preds)
+
+            base_ready = max(car_ready[c], pred_ready)
+
+            best_r = None
+            best_start = None
+
+            for r in allowed_machines[(v, j)]:
+                s = max(base_ready, mach_ready[r])
+                if (best_start is None) or (s < best_start) or (s == best_start and mach_ready[r] < mach_ready[best_r]):
+                    best_start = s
+                    best_r = r
+
+            dur = duration[v][j]
+            s = int(best_start)
+            e = s + int(dur)
+
+            if e > T:
+                raise ValueError(
+                    f"Warmstart exceeds horizon: c={c}, j={j}, start={s}, end={e}, T={T}. "
+                    "Increase T or use a safer upper bound."
+                )
+
+            start_time[(c, j)] = s
+            machine[(c, j)] = best_r
+            end_time[(c, j)] = e
+
+            # update availabilities
+            car_ready[c] = e
+            mach_ready[best_r] = e
+
+    return start_time, machine
+
+
+def apply_mip_start(S, Y, start_time, machine, CARS, J, R, T):
+    """
+    Write warmstart into gurobi vars via .Start
+    """
+    # set all starts to 0 (optional, but makes it clean)
+    for c in range(CARS):
+        for j in range(J):
+            for t in range(T):
+                S[c, j, t].Start = 0
+            for r in range(R):
+                Y[c, j, r].Start = 0
+
+    # set chosen ones
+    for c in range(CARS):
+        for j in range(J):
+            t0 = start_time[(c, j)]
+            r0 = machine[(c, j)]
+            S[c, j, t0].Start = 1
+            Y[c, j, r0].Start = 1

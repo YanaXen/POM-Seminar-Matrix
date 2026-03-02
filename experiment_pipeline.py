@@ -5,7 +5,7 @@ import pandas as pd
 import os
 
 from experiment_config import experiment_configuration
-from utils import extract_schedule_cars, usage
+from utils import extract_schedule_cars, usage, active_interval_utilization, build_greedy_warmstart, apply_mip_start
 from diagram_generation import diagram_generation
 
 def run_model(Operations, Ressources, predecessors, duration, q, variants):
@@ -110,15 +110,26 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
         for t in range(T):
             m.addConstr(gp.quicksum(gp.quicksum(S[c,j,q] for q in range(max(FEZ[j], t - duration[type_of[c]][j] + 1), min(latest[(c,j)], t) + 1)) for j in range(J)) <= 1)
 
-    m.setParam("TimeLimit", 1800)  # 30 minutes
-    m.setParam("MIPGap", 0.01) 
-    # m.setParam("MIPFocus", 2)
+    m.setParam("TimeLimit", 1800)  # 1800 30 minutes
+    #m.setParam("MIPGap", 0.02) 
+    #m.setParam("Heuristics", 0.2)
+    # start_time, machine = build_greedy_warmstart(
+    #     CARS=CARS,
+    #     J=J,
+    #     R=R,
+    #     T=T,
+    #     duration=duration,
+    #     type_of=type_of,
+    #     predecessors=predecessors,
+    #     allowed_machines=allowed_machines
+    # )
 
-    # Solve
+    # apply_mip_start(S, Y, start_time, machine, CARS, J, R, T)
+    
     m.optimize()
 
     if m.SolCount == 0:
-        return None, None, None, None, m.Status, m.Runtime, None
+        return None, None, None, None, None, None, m.Status, m.Runtime, None
 
     makespan = C.X
 
@@ -127,25 +138,26 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
         for job in range(len(Operations)):
             total_work_content += duration[variant][job] * q[variant]
 
-    # schedule = extract_schedule_cars(S, Y, duration, type_of, CARS, J, R, T, eps=0.5)
-    # machine_usage, downtime_per_machine, downtime_over_makespan = usage(schedule, makespan)
     schedule = extract_schedule_cars(S, Y, duration, type_of, CARS, J, R, T, eps=0.5)
 
-    # NEU: R übergeben (damit alle Maschinen berücksichtigt werden)
     machine_usage, downtime_per_machine, downtime_over_makespan = usage(schedule, makespan, R=R)
 
+    active_usage = active_interval_utilization(schedule, R=R, skip_first_last=True)
+
     gap = m.MIPGap if m.Status in [GRB.OPTIMAL, GRB.TIME_LIMIT] else None
-    return makespan, downtime_per_machine, downtime_over_makespan, machine_usage, total_work_content, m.Status, m.Runtime, gap
+    return makespan, downtime_per_machine, downtime_over_makespan, machine_usage, active_usage, total_work_content, m.Status, m.Runtime, gap
 
 def main(continue_run = False):
-    results = pd.DataFrame(columns=["experiment", "experiment_version", "makespan", "downtime_over_makespan", "downtime_per_machine", "usage", "total_work_content", "status", "runtime", "gap"])
+    results = pd.DataFrame(columns=["experiment", "experiment_version", "makespan", "downtime_over_makespan", "downtime_per_machine", "usage", "active_usage", "total_work_content", "status", "runtime", "gap"])
 
-    if continue_run and os.path.exists("data/experiment_results_backup_3.csv"):
-        results = pd.read_csv("data/experiment_results_backup_3.csv", index_col=0)
+    if continue_run and os.path.exists("data/experiment_results_backup_9.csv"):
+        results = pd.read_csv("data/experiment_results_backup_9.csv")
     
     done = set(zip( results["experiment"].astype(str), results["experiment_version"].astype(str)))
 
     for experiment in experiment_configuration.keys():
+        if experiment not in  ["Experiment 1", "Experiment 2", "Experiment 6", "Experiment 7"]:
+            continue
         for variation in experiment_configuration[experiment].keys():
             key = (str(experiment), str(variation))
             if key in done:
@@ -158,7 +170,9 @@ def main(continue_run = False):
             q = experiment_configuration[experiment][variation]["q"]
             variants = experiment_configuration[experiment][variation]["variants"]
             
-            makespan, downtime_per_machine, downtime_over_makespan, usage, total_work_content, status, runtime, gap = run_model(operations, ressources, predecessors, duration, q, variants)
+
+            print(f"starting experiment {experiment} and variant {variation}")
+            makespan, downtime_per_machine, downtime_over_makespan, usage, active_usage, total_work_content, status, runtime, gap = run_model(operations, ressources, predecessors, duration, q, variants)
             print(downtime_per_machine)
             row = {
                 "experiment": experiment,
@@ -167,6 +181,7 @@ def main(continue_run = False):
                 "downtime_over_makespan": downtime_over_makespan,
                 "downtime_per_machine": downtime_per_machine,
                 "usage": usage,
+                "active_usage": active_usage,
                 "total_work_content": total_work_content,
                 "status": status,
                 "runtime": runtime,
@@ -177,14 +192,14 @@ def main(continue_run = False):
 
             done.add(key)
 
-            results.to_csv("data/experiment_results_backup_3.csv")
+            results.to_csv("data/experiment_results_backup_9.csv", index=False)
 
 
-    # create diagrams #ToDo
+    # create diagrams 
     diagram_generation(results)
 
     # save data
-    results.to_csv("data/experiment_results_3.csv")
+    results.to_csv("data/experiment_results_9.csv")
 
 if __name__ == "__main__":
     main(continue_run=False)
