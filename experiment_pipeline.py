@@ -4,14 +4,35 @@ from gurobipy import *
 import pandas as pd
 import os
 
-from experiment_config import experiment_configuration
-from utils import extract_schedule_cars, usage, active_interval_utilization, build_greedy_warmstart, apply_mip_start
-from diagram_generation import diagram_generation
+from utils import extract_schedule, usage, active_interval_utilization, build_greedy_warmstart, apply_mip_start
 
-def run_model(Operations, Ressources, predecessors, duration, q, variants):
+def run_model(Operations, Resources , predecessors, duration, q, variants):
+    """
+    Builds and solves an RCPSP-like scheduling model with Gurobi for multiple
+    product variants and resource-dependent operations.
+
+    Args:
+        Operations (list): List of operations.
+        Resources (list): List of available machines/resources.
+        predecessors (dict): Precedence relations for each operation.
+        duration (dict): Processing times per variant and operation.
+        q (dict): Number of products to be produced per variant.
+        variants (dict): Allowed machines per variant and operation.
+
+    Returns:
+        makespan (float): Objective value of the solved schedule.
+        downtime_per_machine (dict): Downtime for each machine.
+        downtime_over_makespan (dict): Downtime per machine relative to the makespan.
+        machine_usage (dict): Overall utilization per machine.
+        active_usage (dict): Utilization over active intervals.
+        total_work_content (float): Total processing time over all products.
+        status (int): Gurobi solver status code.
+        runtime (float): Solver runtime in seconds.
+        gap (float | None): MIP gap if available, otherwise None.
+    """
 
     J= len(Operations)
-    R= len(Ressources)
+    R= len(Resources )
     V = len(variants)
 
     allowed_machines= {}
@@ -20,15 +41,15 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
         for j in range(len(variants[v])):
             allowed_machines.update({(v,j): variants[v][j]})
 
-    cars = [] # each car produced of each variant becomes it's own entity
+    products = [] # each product produced of each variant becomes it's own entity
     for v in variants.keys():
         for idx in range(q[v]):
-            cars.append((v, idx))
+            products.append((v, idx))
 
-    CARS = len(cars)
-    type_of = {c: cars[c][0] for c in range(CARS)}
+    PRODUCTS = len(products)
+    type_of = {c: products[c][0] for c in range(PRODUCTS)}
     sum_d = sum(duration[0])
-    T = CARS * sum_d 
+    T = PRODUCTS * sum_d 
     
 
     FEZ = [0]*J
@@ -37,8 +58,8 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
     m = gp.Model("RCPSP")
 
     # decision variables
-    S = m.addVars(CARS, J, T, vtype= GRB.BINARY) # ==1 if job j starts for car c in time t
-    Y = m.addVars(CARS, J, R, vtype=GRB.BINARY) # ==1 if job j is for car c on maschine r
+    S = m.addVars(PRODUCTS, J, T, vtype= GRB.BINARY) # ==1 if job j starts for product c in time t
+    Y = m.addVars(PRODUCTS, J, R, vtype=GRB.BINARY) # ==1 if job j is for product c on maschine r
     C = m.addVar(lb= 0, vtype= GRB.CONTINUOUS) # makespan
 
     # Objective
@@ -46,15 +67,15 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
 
     # Constraints
 
-    # symbreak (cars are sorted depending on their starting timepoint)
-    cars_by_v = {v: [c for c in range(CARS) if type_of[c] == v] for v in range(V)}
+    # symbreak (products are sorted depending on their starting timepoint)
+    products_by_v = {v: [c for c in range(PRODUCTS) if type_of[c] == v] for v in range(V)}
 
-    for v in cars_by_v:
-        cars_by_v[v].sort()
+    for v in products_by_v:
+        products_by_v[v].sort()
 
     j0 = 0
-    for v, car_list in cars_by_v.items():
-        for a, b in zip(car_list[:-1], car_list[1:]):
+    for v, product_list in products_by_v.items():
+        for a, b in zip(product_list[:-1], product_list[1:]):
             m.addConstr(
                 quicksum(t * S[a, j0, t] for t in range(FEZ[j0], SEZ[j0] + 1))
                 <=
@@ -63,19 +84,19 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
             )
 
     # time constraint
-    for c in range(CARS):
+    for c in range(PRODUCTS):
         for j in range(J):
             m.addConstr(C >= sum((t + duration[type_of[c]][j]) * S[c,j,t] for t in range(FEZ[j], SEZ[j]+1)))
 
     # timeslot constraint
     # the job needs to be finished in a certain timeframe
-    for c in range(CARS):
+    for c in range(PRODUCTS):
         for j in range(J):
             m.addConstr((quicksum(S[c, j, t] for t in range(FEZ[j], SEZ[j]+1)) == 1))
 
     # variant_based useable machines
     # variants are allowed to be produced on a predefined set of machines
-    for c in range(CARS):
+    for c in range(PRODUCTS):
         v = type_of[c]
         for j in range(J):
             m.addConstr(quicksum(Y[c,j,r] for r in allowed_machines[(v,j)]) == 1)
@@ -85,7 +106,7 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
 
     # precendence constraint
     # realise the order of the correct process
-    for c in range(CARS):
+    for c in range(PRODUCTS):
         for j in range(J):
                 for h in predecessors[j]:
                         m.addConstr(quicksum(t * S[c,h, t] for t in range(FEZ[h], SEZ[h]+1)) + duration[type_of[c]][h] <= quicksum(t * S[c,j, t] for t in range(FEZ[j], SEZ[j]+1)))
@@ -94,19 +115,19 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
     # the defined capacity needs to be kept
     for r in range(R):
         for t in range(T):
-            m.addConstr((quicksum(Y[c,j,r] * quicksum(S[c,j,q] for q in range(max(FEZ[j], t - duration[type_of[c]][j] + 1), min(SEZ[j], t) + 1)) for c in range(CARS) for j in range(J)) <= 1))
+            m.addConstr((quicksum(Y[c,j,r] * quicksum(S[c,j,q] for q in range(max(FEZ[j], t - duration[type_of[c]][j] + 1), min(SEZ[j], t) + 1)) for c in range(PRODUCTS) for j in range(J)) <= 1))
 
-    latest = {(c,j): min(SEZ[j], T - duration[type_of[c]][j]) for c in range(CARS) for j in range(J)}
+    latest = {(c,j): min(SEZ[j], T - duration[type_of[c]][j]) for c in range(PRODUCTS) for j in range(J)}
 
     # ensuring that no job ende after the defined periods
-    for c in range(CARS):
+    for c in range(PRODUCTS):
         for j in range(J):
             for t in range(T):
                 if t < FEZ[j] or t > latest[(c,j)]:
                     m.addConstr(S[c,j,t] == 0)
 
-    # each variant can only be at a machine at the same time
-    for c in range(CARS):
+    # each product can only be at a machine at the same time
+    for c in range(PRODUCTS):
         for t in range(T):
             m.addConstr(gp.quicksum(gp.quicksum(S[c,j,q] for q in range(max(FEZ[j], t - duration[type_of[c]][j] + 1), min(latest[(c,j)], t) + 1)) for j in range(J)) <= 1)
 
@@ -114,7 +135,7 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
     #m.setParam("MIPGap", 0.02) 
     #m.setParam("Heuristics", 0.2)
     # start_time, machine = build_greedy_warmstart(
-    #     CARS=CARS,
+    #     PRODUCTS=PRODUCTS,
     #     J=J,
     #     R=R,
     #     T=T,
@@ -124,7 +145,7 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
     #     allowed_machines=allowed_machines
     # )
 
-    # apply_mip_start(S, Y, start_time, machine, CARS, J, R, T)
+    # apply_mip_start(S, Y, start_time, machine, PRODUCTS, J, R, T)
     
     m.optimize()
 
@@ -138,7 +159,7 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
         for job in range(len(Operations)):
             total_work_content += duration[variant][job] * q[variant]
 
-    schedule = extract_schedule_cars(S, Y, duration, type_of, CARS, J, R, T, eps=0.5)
+    schedule = extract_schedule(S, Y, duration, type_of, PRODUCTS, J, R, T, eps=0.5)
 
     machine_usage, downtime_per_machine, downtime_over_makespan = usage(schedule, makespan, R=R)
 
@@ -146,60 +167,3 @@ def run_model(Operations, Ressources, predecessors, duration, q, variants):
 
     gap = m.MIPGap if m.Status in [GRB.OPTIMAL, GRB.TIME_LIMIT] else None
     return makespan, downtime_per_machine, downtime_over_makespan, machine_usage, active_usage, total_work_content, m.Status, m.Runtime, gap
-
-def main(continue_run = False):
-    results = pd.DataFrame(columns=["experiment", "experiment_version", "makespan", "downtime_over_makespan", "downtime_per_machine", "usage", "active_usage", "total_work_content", "status", "runtime", "gap"])
-
-    if continue_run and os.path.exists("data/experiment_results_backup_9.csv"):
-        results = pd.read_csv("data/experiment_results_backup_9.csv")
-    
-    done = set(zip( results["experiment"].astype(str), results["experiment_version"].astype(str)))
-
-    for experiment in experiment_configuration.keys():
-        if experiment not in  ["Experiment 1", "Experiment 2", "Experiment 6", "Experiment 7"]:
-            continue
-        for variation in experiment_configuration[experiment].keys():
-            key = (str(experiment), str(variation))
-            if key in done:
-                continue    
-
-            operations = experiment_configuration[experiment][variation]["Operations"]
-            ressources = experiment_configuration[experiment][variation]["Ressources"]
-            predecessors = experiment_configuration[experiment][variation]["predecessors"]
-            duration = experiment_configuration[experiment][variation]["duration"]
-            q = experiment_configuration[experiment][variation]["q"]
-            variants = experiment_configuration[experiment][variation]["variants"]
-            
-
-            print(f"starting experiment {experiment} and variant {variation}")
-            makespan, downtime_per_machine, downtime_over_makespan, usage, active_usage, total_work_content, status, runtime, gap = run_model(operations, ressources, predecessors, duration, q, variants)
-            print(downtime_per_machine)
-            row = {
-                "experiment": experiment,
-                "experiment_version": variation,
-                "makespan": makespan,
-                "downtime_over_makespan": downtime_over_makespan,
-                "downtime_per_machine": downtime_per_machine,
-                "usage": usage,
-                "active_usage": active_usage,
-                "total_work_content": total_work_content,
-                "status": status,
-                "runtime": runtime,
-                "gap": gap
-            }
-
-            results.loc[len(results)] = row
-
-            done.add(key)
-
-            results.to_csv("data/experiment_results_backup_9.csv", index=False)
-
-
-    # create diagrams 
-    diagram_generation(results)
-
-    # save data
-    results.to_csv("data/experiment_results_9.csv")
-
-if __name__ == "__main__":
-    main(continue_run=False)
