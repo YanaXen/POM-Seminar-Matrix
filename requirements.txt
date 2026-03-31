@@ -1,0 +1,5 @@
+# Tested with Python 3.13.8
+gurobipy
+pandas==2.3.3
+numpy==2.2.6
+matplotlib==3.10.1
